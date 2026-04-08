@@ -103,6 +103,9 @@ jobs:
 
 Supply `arm_client_id`, `arm_tenant_id`, and `arm_subscription_id` to authenticate via OIDC instead of a service principal JSON credential. The calling workflow must also declare `permissions: id-token: write`.
 
+> **Two federated credentials are required when using an approval environment.**
+> The plan job (`terraform-plan-destroy`) runs without an environment, so its OIDC subject is `repo:<org>/<repo>:ref:refs/heads/<branch>`. The destroy job (`terraform-destroy`) runs with `environment: <name>`, so its OIDC subject is `repo:<org>/<repo>:environment:<name>`. Azure must be able to match both subjects, which means you need one federated credential scoped to the branch **and** one scoped to the environment. If no `environment` input is provided, only the branch-scoped federated credential is needed.
+
 | Input | Description | Required | Default |
 |---|---|---|---|
 | `arm_client_id` | Azure client (application) ID | No | `''` |
@@ -189,6 +192,15 @@ Supply `arm_client_id`, `arm_tenant_id`, and `arm_subscription_id` to authentica
 Provide either:
 - `azure_credentials` (service principal JSON) for static credential auth, or
 - `arm_client_id` + `arm_tenant_id` + `arm_subscription_id` (inputs) for OIDC — also requires `permissions: id-token: write` in the calling workflow
+
+When using OIDC with an approval environment, configure **two** federated credentials on the Azure app registration or managed identity:
+
+| Federated credential | Entity type | Value |
+|---|---|---|
+| Plan job | Branch | `main` (or whichever branch the calling workflow runs on) |
+| Destroy job | Environment | The exact name passed as the `environment` input (e.g. `destroy-approval`) |
+
+If no `environment` input is provided, only the branch-scoped federated credential is needed.
 
 ### AWS
 
