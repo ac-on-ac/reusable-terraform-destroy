@@ -1,4 +1,4 @@
-# reusable-terraform-destroy
+# Reusable Terraform Destroy
 
 A reusable GitHub Actions workflow that runs `terraform destroy` with an optional manual approval gate before any infrastructure is removed.
 
@@ -220,4 +220,3 @@ No login action is used. Credentials are exported as environment variables (`SNO
 - **Plan drift protection.** Terraform validates the saved plan against current state before applying. If state has changed between the plan and the approval, Terraform will error rather than apply a stale plan.
 - **Backend partial config validation.** If any Azure backend input is provided, all four must be present. If `s3_backend_bucket` is set, `s3_backend_key` must also be set. The workflow fails early with a clear error otherwise.
 - **`TF_VAR_*` enforcement.** The `terraform_vars` input only accepts keys prefixed with `TF_VAR_`. Any other key causes an immediate failure before Terraform runs.
-
