@@ -1,0 +1,503 @@
+name: Terraform Destroy
+
+permissions:
+  contents: read
+  id-token: write
+
+on:
+  workflow_call:
+    inputs:
+      working_directory:
+        description: "Directory containing the Terraform configuration. Defaults to the repository root."
+        required: false
+        type: string
+        default: '.'
+      terraform_version:
+        description: "Version of Terraform to install (e.g. 1.11.0). Defaults to latest."
+        required: false
+        type: string
+        default: 'latest'
+      terraform_vars:
+        description: >
+          Optional newline-separated KEY=VALUE pairs exported as environment
+          variables before the destroy runs. Only TF_VAR_* keys are permitted.
+        required: false
+        type: string
+        default: ''
+      aws_region:
+        description: "AWS region for AWS login and the default region for the S3 backend. Defaults to us-east-1."
+        required: false
+        type: string
+        default: 'us-east-1'
+      environment:
+        description: >
+          Name of the GitHub environment with required reviewers configured.
+          When set, the destroy job will pause for manual approval after the
+          plan is shown. Reviewers will receive a notification and can review
+          the plan in the job summary before approving or rejecting.
+          Leave empty to skip the approval gate and destroy immediately.
+        required: false
+        type: string
+        default: ''
+
+      # Azure OIDC — supply these three instead of azure_credentials to authenticate via OIDC.
+      # The calling workflow must also declare: permissions: id-token: write
+      arm_client_id:
+        description: "Azure client (application) ID for OIDC authentication."
+        required: false
+        type: string
+        default: ''
+      arm_tenant_id:
+        description: "Azure tenant ID for OIDC authentication."
+        required: false
+        type: string
+        default: ''
+      arm_subscription_id:
+        description: "Azure subscription ID for OIDC authentication."
+        required: false
+        type: string
+        default: ''
+
+      # Azure blob storage backend
+      azure_backend_resource_group_name:
+        description: "Resource group containing the Azure Storage Account used for Terraform state."
+        required: false
+        type: string
+        default: ''
+      azure_backend_storage_account_name:
+        description: "Azure Storage Account name for Terraform state."
+        required: false
+        type: string
+        default: ''
+      azure_backend_container_name:
+        description: "Azure Blob Storage container name for Terraform state."
+        required: false
+        type: string
+        default: ''
+      azure_backend_key:
+        description: "Blob name (path) for the Terraform state file within the container."
+        required: false
+        type: string
+        default: ''
+
+      # S3 backend
+      s3_backend_bucket:
+        description: "S3 bucket name for Terraform state."
+        required: false
+        type: string
+        default: ''
+      s3_backend_key:
+        description: "S3 object key (path) for the Terraform state file."
+        required: false
+        type: string
+        default: ''
+      s3_backend_region:
+        description: "AWS region of the S3 bucket. Defaults to aws_region when not set."
+        required: false
+        type: string
+        default: ''
+      s3_backend_dynamodb_table:
+        description: "DynamoDB table name for Terraform state locking (optional)."
+        required: false
+        type: string
+        default: ''
+
+    secrets:
+      # Azure
+      azure_credentials:
+        required: false
+      databricks_host:
+        required: false
+      databricks_azure_workspace_resource_id:
+        required: false
+      # Terraform Cloud / Enterprise
+      terraform_token:
+        required: false
+      # AWS
+      aws_access_key_id:
+        required: false
+      aws_secret_access_key:
+        required: false
+      aws_role_to_assume:
+        required: false
+      # GitHub
+      gh_token:
+        required: false
+      # HashiCorp Vault
+      vault_addr:
+        required: false
+      vault_token:
+        required: false
+      vault_role_id:
+        required: false
+      vault_secret_id:
+        required: false
+      # Snowflake
+      snowflake_account:
+        required: false
+      snowflake_user:
+        required: false
+      snowflake_password:
+        required: false
+      snowflake_role:
+        required: false
+      # Grafana
+      grafana_url:
+        required: false
+      grafana_auth:
+        required: false
+
+jobs:
+  terraform-plan-destroy:
+    runs-on: ubuntu-latest
+    env:
+      TF_TOKEN_app_terraform_io: ${{ secrets.terraform_token }}
+      TFE_TOKEN: ${{ secrets.terraform_token }}
+      AZURE_CREDENTIALS: ${{ secrets.azure_credentials }}
+      ARM_CLIENT_ID: ${{ inputs.arm_client_id }}
+      DATABRICKS_HOST: ${{ secrets.databricks_host }}
+      DATABRICKS_AZURE_RESOURCE_ID: ${{ secrets.databricks_azure_workspace_resource_id }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.aws_access_key_id }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.aws_secret_access_key }}
+      AWS_ROLE_TO_ASSUME: ${{ secrets.aws_role_to_assume }}
+      GITHUB_TOKEN_PROVIDER: ${{ secrets.gh_token }}
+      VAULT_ADDR: ${{ secrets.vault_addr }}
+      VAULT_TOKEN: ${{ secrets.vault_token }}
+      VAULT_ROLE_ID: ${{ secrets.vault_role_id }}
+      VAULT_SECRET_ID: ${{ secrets.vault_secret_id }}
+      SNOWFLAKE_ACCOUNT: ${{ secrets.snowflake_account }}
+      SNOWFLAKE_USER: ${{ secrets.snowflake_user }}
+      SNOWFLAKE_PASSWORD: ${{ secrets.snowflake_password }}
+      SNOWFLAKE_ROLE: ${{ secrets.snowflake_role }}
+      GRAFANA_URL: ${{ secrets.grafana_url }}
+      GRAFANA_AUTH: ${{ secrets.grafana_auth }}
+
+    steps:
+      - name: Verify environment exists
+        if: inputs.environment != ''
+        uses: actions/github-script@v7
+        env:
+          ENVIRONMENT_NAME: ${{ inputs.environment }}
+        with:
+          script: |
+            const name = process.env.ENVIRONMENT_NAME;
+            try {
+              await github.rest.repos.getEnvironment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                environment_name: name
+              });
+              core.info(`Environment '${name}' found.`);
+            } catch (err) {
+              if (err.status === 404) {
+                core.setFailed(
+                  `Environment '${name}' does not exist in ` +
+                  `${context.repo.owner}/${context.repo.repo}. ` +
+                  `Create it in Settings → Environments and configure ` +
+                  `Required reviewers before using this workflow.`
+                );
+              } else {
+                throw err;
+              }
+            }
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Validate working_directory
+        run: |
+          resolved=$(realpath -m "$WORKING_DIR")
+          repo_root=$(realpath "$GITHUB_WORKSPACE")
+          if [[ "$resolved" != "$repo_root" && "$resolved" != "$repo_root/"* ]]; then
+            echo "::error::working_directory '$WORKING_DIR' resolves outside the repository root."
+            exit 1
+          fi
+          if [ ! -d "$resolved" ]; then
+            echo "::error::working_directory '$WORKING_DIR' does not exist."
+            exit 1
+          fi
+        env:
+          WORKING_DIR: ${{ inputs.working_directory }}
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      - name: Azure Login (service principal)
+        if: env.AZURE_CREDENTIALS != '' && env.ARM_CLIENT_ID == ''
+        uses: azure/login@v3
+        with:
+          creds: ${{ secrets.azure_credentials }}
+
+      - name: Azure Login (OIDC)
+        if: env.ARM_CLIENT_ID != ''
+        uses: azure/login@v3
+        with:
+          client-id: ${{ inputs.arm_client_id }}
+          tenant-id: ${{ inputs.arm_tenant_id }}
+          subscription-id: ${{ inputs.arm_subscription_id }}
+
+      - name: AWS Login
+        if: env.AWS_ACCESS_KEY_ID != '' || env.AWS_ROLE_TO_ASSUME != ''
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.aws_access_key_id }}
+          aws-secret-access-key: ${{ secrets.aws_secret_access_key }}
+          role-to-assume: ${{ secrets.aws_role_to_assume }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: HashiCorp Vault Login
+        if: env.VAULT_ADDR != '' && (env.VAULT_TOKEN != '' || (env.VAULT_ROLE_ID != '' && env.VAULT_SECRET_ID != ''))
+        uses: hashicorp/vault-action@v3
+        with:
+          url: ${{ secrets.vault_addr }}
+          token: ${{ secrets.vault_token }}
+          roleId: ${{ secrets.vault_role_id }}
+          secretId: ${{ secrets.vault_secret_id }}
+
+      - name: Set Terraform variables
+        if: inputs.terraform_vars != ''
+        env:
+          TERRAFORM_VARS: ${{ inputs.terraform_vars }}
+        run: |
+          while IFS= read -r line || [ -n "$line" ]; do
+            [ -z "$line" ] && continue
+            key="${line%%=*}"
+            if [[ "$key" != TF_VAR_* ]]; then
+              echo "::error::terraform_vars contains disallowed key '$key'. Only TF_VAR_* keys are permitted."
+              exit 1
+            fi
+            echo "$line" >> $GITHUB_ENV
+          done <<< "$TERRAFORM_VARS"
+
+      - name: Validate backend inputs
+        env:
+          AZURE_BACKEND_RG: ${{ inputs.azure_backend_resource_group_name }}
+          AZURE_BACKEND_SA: ${{ inputs.azure_backend_storage_account_name }}
+          AZURE_BACKEND_CONTAINER: ${{ inputs.azure_backend_container_name }}
+          AZURE_BACKEND_KEY: ${{ inputs.azure_backend_key }}
+          S3_BACKEND_BUCKET: ${{ inputs.s3_backend_bucket }}
+          S3_BACKEND_KEY: ${{ inputs.s3_backend_key }}
+        run: |
+          if [ -n "$AZURE_BACKEND_RG" ]; then
+            missing=()
+            [ -z "$AZURE_BACKEND_SA" ]        && missing+=(azure_backend_storage_account_name)
+            [ -z "$AZURE_BACKEND_CONTAINER" ] && missing+=(azure_backend_container_name)
+            [ -z "$AZURE_BACKEND_KEY" ]        && missing+=(azure_backend_key)
+            if [ ${#missing[@]} -gt 0 ]; then
+              echo "::error::Azure backend is partially configured. Missing: ${missing[*]}"
+              exit 1
+            fi
+          fi
+          if [ -n "$S3_BACKEND_BUCKET" ] && [ -z "$S3_BACKEND_KEY" ]; then
+            echo "::error::s3_backend_key must be provided when s3_backend_bucket is set."
+            exit 1
+          fi
+
+      - name: Terraform Init
+        env:
+          WORKING_DIR: ${{ inputs.working_directory }}
+          AZURE_BACKEND_RG: ${{ inputs.azure_backend_resource_group_name }}
+          AZURE_BACKEND_SA: ${{ inputs.azure_backend_storage_account_name }}
+          AZURE_BACKEND_CONTAINER: ${{ inputs.azure_backend_container_name }}
+          AZURE_BACKEND_KEY: ${{ inputs.azure_backend_key }}
+          S3_BACKEND_BUCKET: ${{ inputs.s3_backend_bucket }}
+          S3_BACKEND_KEY: ${{ inputs.s3_backend_key }}
+          S3_BACKEND_REGION: ${{ inputs.s3_backend_region }}
+          S3_BACKEND_DYNAMODB: ${{ inputs.s3_backend_dynamodb_table }}
+          AWS_REGION: ${{ inputs.aws_region }}
+        run: |
+          init_args=()
+          if [ -n "$AZURE_BACKEND_RG" ]; then
+            init_args+=(
+              "-backend-config=resource_group_name=$AZURE_BACKEND_RG"
+              "-backend-config=storage_account_name=$AZURE_BACKEND_SA"
+              "-backend-config=container_name=$AZURE_BACKEND_CONTAINER"
+              "-backend-config=key=$AZURE_BACKEND_KEY"
+            )
+          elif [ -n "$S3_BACKEND_BUCKET" ]; then
+            region="${S3_BACKEND_REGION:-$AWS_REGION}"
+            init_args+=(
+              "-backend-config=bucket=$S3_BACKEND_BUCKET"
+              "-backend-config=key=$S3_BACKEND_KEY"
+              "-backend-config=region=$region"
+            )
+            [ -n "$S3_BACKEND_DYNAMODB" ] && init_args+=("-backend-config=dynamodb_table=$S3_BACKEND_DYNAMODB")
+          fi
+          terraform -chdir="$WORKING_DIR" init "${init_args[@]}"
+
+      - name: Terraform Plan (destroy)
+        env:
+          WORKING_DIR: ${{ inputs.working_directory }}
+        run: |
+          set +e
+          plan_output=$(terraform -chdir="$WORKING_DIR" plan -destroy -no-color -out=tfplan 2>&1)
+          exit_code=$?
+          set -e
+          echo "$plan_output"
+          if [ $exit_code -ne 0 ]; then
+            exit $exit_code
+          fi
+          {
+            echo "## :warning: Terraform Destroy Plan"
+            echo ""
+            echo "The following resources will be **permanently destroyed** if this run is approved."
+            echo ""
+            echo '```'
+            echo "${plan_output:0:60000}"
+            echo '```'
+            if [ ${#plan_output} -gt 60000 ]; then
+              echo ""
+              echo "_Output truncated at 60,000 characters. View the full plan in the job logs._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload destroy plan
+        uses: actions/upload-artifact@v7
+        with:
+          name: tfplan-${{ github.run_id }}
+          path: ${{ inputs.working_directory }}/tfplan
+          retention-days: 1
+
+  terraform-destroy:
+    needs: [terraform-plan-destroy]
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    env:
+      TF_TOKEN_app_terraform_io: ${{ secrets.terraform_token }}
+      TFE_TOKEN: ${{ secrets.terraform_token }}
+      AZURE_CREDENTIALS: ${{ secrets.azure_credentials }}
+      ARM_CLIENT_ID: ${{ inputs.arm_client_id }}
+      DATABRICKS_HOST: ${{ secrets.databricks_host }}
+      DATABRICKS_AZURE_RESOURCE_ID: ${{ secrets.databricks_azure_workspace_resource_id }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.aws_access_key_id }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.aws_secret_access_key }}
+      AWS_ROLE_TO_ASSUME: ${{ secrets.aws_role_to_assume }}
+      GITHUB_TOKEN_PROVIDER: ${{ secrets.gh_token }}
+      VAULT_ADDR: ${{ secrets.vault_addr }}
+      VAULT_TOKEN: ${{ secrets.vault_token }}
+      VAULT_ROLE_ID: ${{ secrets.vault_role_id }}
+      VAULT_SECRET_ID: ${{ secrets.vault_secret_id }}
+      SNOWFLAKE_ACCOUNT: ${{ secrets.snowflake_account }}
+      SNOWFLAKE_USER: ${{ secrets.snowflake_user }}
+      SNOWFLAKE_PASSWORD: ${{ secrets.snowflake_password }}
+      SNOWFLAKE_ROLE: ${{ secrets.snowflake_role }}
+      GRAFANA_URL: ${{ secrets.grafana_url }}
+      GRAFANA_AUTH: ${{ secrets.grafana_auth }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Validate working_directory
+        run: |
+          resolved=$(realpath -m "$WORKING_DIR")
+          repo_root=$(realpath "$GITHUB_WORKSPACE")
+          if [[ "$resolved" != "$repo_root" && "$resolved" != "$repo_root/"* ]]; then
+            echo "::error::working_directory '$WORKING_DIR' resolves outside the repository root."
+            exit 1
+          fi
+          if [ ! -d "$resolved" ]; then
+            echo "::error::working_directory '$WORKING_DIR' does not exist."
+            exit 1
+          fi
+        env:
+          WORKING_DIR: ${{ inputs.working_directory }}
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      - name: Azure Login (service principal)
+        if: env.AZURE_CREDENTIALS != '' && env.ARM_CLIENT_ID == ''
+        uses: azure/login@v3
+        with:
+          creds: ${{ secrets.azure_credentials }}
+
+      - name: Azure Login (OIDC)
+        if: env.ARM_CLIENT_ID != ''
+        uses: azure/login@v3
+        with:
+          client-id: ${{ inputs.arm_client_id }}
+          tenant-id: ${{ inputs.arm_tenant_id }}
+          subscription-id: ${{ inputs.arm_subscription_id }}
+
+      - name: AWS Login
+        if: env.AWS_ACCESS_KEY_ID != '' || env.AWS_ROLE_TO_ASSUME != ''
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.aws_access_key_id }}
+          aws-secret-access-key: ${{ secrets.aws_secret_access_key }}
+          role-to-assume: ${{ secrets.aws_role_to_assume }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: HashiCorp Vault Login
+        if: env.VAULT_ADDR != '' && (env.VAULT_TOKEN != '' || (env.VAULT_ROLE_ID != '' && env.VAULT_SECRET_ID != ''))
+        uses: hashicorp/vault-action@v3
+        with:
+          url: ${{ secrets.vault_addr }}
+          token: ${{ secrets.vault_token }}
+          roleId: ${{ secrets.vault_role_id }}
+          secretId: ${{ secrets.vault_secret_id }}
+
+      - name: Set Terraform variables
+        if: inputs.terraform_vars != ''
+        env:
+          TERRAFORM_VARS: ${{ inputs.terraform_vars }}
+        run: |
+          while IFS= read -r line || [ -n "$line" ]; do
+            [ -z "$line" ] && continue
+            key="${line%%=*}"
+            if [[ "$key" != TF_VAR_* ]]; then
+              echo "::error::terraform_vars contains disallowed key '$key'. Only TF_VAR_* keys are permitted."
+              exit 1
+            fi
+            echo "$line" >> $GITHUB_ENV
+          done <<< "$TERRAFORM_VARS"
+
+      - name: Terraform Init
+        env:
+          WORKING_DIR: ${{ inputs.working_directory }}
+          AZURE_BACKEND_RG: ${{ inputs.azure_backend_resource_group_name }}
+          AZURE_BACKEND_SA: ${{ inputs.azure_backend_storage_account_name }}
+          AZURE_BACKEND_CONTAINER: ${{ inputs.azure_backend_container_name }}
+          AZURE_BACKEND_KEY: ${{ inputs.azure_backend_key }}
+          S3_BACKEND_BUCKET: ${{ inputs.s3_backend_bucket }}
+          S3_BACKEND_KEY: ${{ inputs.s3_backend_key }}
+          S3_BACKEND_REGION: ${{ inputs.s3_backend_region }}
+          S3_BACKEND_DYNAMODB: ${{ inputs.s3_backend_dynamodb_table }}
+          AWS_REGION: ${{ inputs.aws_region }}
+        run: |
+          init_args=()
+          if [ -n "$AZURE_BACKEND_RG" ]; then
+            init_args+=(
+              "-backend-config=resource_group_name=$AZURE_BACKEND_RG"
+              "-backend-config=storage_account_name=$AZURE_BACKEND_SA"
+              "-backend-config=container_name=$AZURE_BACKEND_CONTAINER"
+              "-backend-config=key=$AZURE_BACKEND_KEY"
+            )
+          elif [ -n "$S3_BACKEND_BUCKET" ]; then
+            region="${S3_BACKEND_REGION:-$AWS_REGION}"
+            init_args+=(
+              "-backend-config=bucket=$S3_BACKEND_BUCKET"
+              "-backend-config=key=$S3_BACKEND_KEY"
+              "-backend-config=region=$region"
+            )
+            [ -n "$S3_BACKEND_DYNAMODB" ] && init_args+=("-backend-config=dynamodb_table=$S3_BACKEND_DYNAMODB")
+          fi
+          terraform -chdir="$WORKING_DIR" init "${init_args[@]}"
+
+      - name: Download destroy plan
+        uses: actions/download-artifact@v8
+        with:
+          name: tfplan-${{ github.run_id }}
+          path: ${{ inputs.working_directory }}
+
+      - name: Terraform Destroy
+        env:
+          WORKING_DIR: ${{ inputs.working_directory }}
+        run: terraform -chdir="$WORKING_DIR" apply -no-color tfplan
